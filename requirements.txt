@@ -1,0 +1,12 @@
+torch>=2.2
+torchvision>=0.17
+transformers>=4.44
+huggingface_hub>=0.24
+datasets>=2.20
+accelerate>=0.33
+sentencepiece>=0.2
+protobuf>=4.25
+pillow>=10.0
+matplotlib>=3.8
+qwen-vl-utils>=0.0.8
+python-dotenv>=1.0
