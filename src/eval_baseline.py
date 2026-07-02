@@ -9,6 +9,11 @@ otherwise blow attention memory past 20GB for a single image. We cap
 min/max pixels (see config.py) and run in batches sized to fit whatever GPU
 you have.
 
+Prompts append a short-answer instruction by default so Qwen2-VL's chat-style
+full-sentence answers don't tank ANLS purely on string-length/format grounds
+against DocVQA's terse extractive references. Disable with
+--no-short-answer-prompt to see raw, verbose answers.
+
 Usage:
     python src/eval_baseline.py
     python src/eval_baseline.py --limit 20 --batch-size 4 --notify
@@ -31,12 +36,24 @@ from metrics import anls
 from models import load_baseline_vlm
 from notify import notify_discord
 
+# ANLS is an edit-distance metric tuned for terse, extractive DocVQA-style
+# answers ("ITC Limited"). Qwen2-VL-Instruct is chat-tuned and will otherwise
+# answer in full sentences ("The name of the company is ITC Limited."), which
+# tanks ANLS on string-length grounds alone even when the content is correct.
+# This is the standard VQA-eval prompting trick (also used by LLaVA/Qwen-VL's
+# own eval harnesses) to get answer style to match the reference format.
+SHORT_ANSWER_SUFFIX = "\nAnswer the question using a single word or phrase."
+
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--limit", type=int, default=None, help="cap test set size, for a quick run")
     p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--max-new-tokens", type=int, default=32)
+    p.add_argument("--max-new-tokens", type=int, default=16)
+    p.add_argument(
+        "--no-short-answer-prompt", action="store_true",
+        help="disable the 'answer in a word or phrase' suffix (verbose, full-sentence answers)",
+    )
     p.add_argument(
         "--max-pixels", type=int, default=BASELINE_MAX_PIXELS,
         help="lower this if you hit OOM; raise it (GPU permitting) for sharper document text",
@@ -55,7 +72,8 @@ def batched(seq, n):
 
 
 @torch.no_grad()
-def run(processor, model, device, records, max_new_tokens, batch_size):
+def run(processor, model, device, records, max_new_tokens, batch_size, short_answer_prompt=True):
+    suffix = SHORT_ANSWER_SUFFIX if short_answer_prompt else ""
     rows = []
     for batch in batched(records, batch_size):
         conversations = [
@@ -64,7 +82,7 @@ def run(processor, model, device, records, max_new_tokens, batch_size):
                     "role": "user",
                     "content": [
                         {"type": "image", "image": rec["image"]},
-                        {"type": "text", "text": rec["question"]},
+                        {"type": "text", "text": rec["question"] + suffix},
                     ],
                 }
             ]
@@ -113,7 +131,10 @@ def main():
     processor, model = load_baseline_vlm(min_pixels=args.min_pixels, max_pixels=args.max_pixels)
 
     try:
-        rows = run(processor, model, device, records, args.max_new_tokens, args.batch_size)
+        rows = run(
+            processor, model, device, records, args.max_new_tokens, args.batch_size,
+            short_answer_prompt=not args.no_short_answer_prompt,
+        )
     except RuntimeError as e:
         # Covers CUDA OOM and MPS "Invalid buffer size" -- both mean the
         # batch/resolution was too large for available device memory.
