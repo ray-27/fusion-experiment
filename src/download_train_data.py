@@ -8,11 +8,14 @@ import argparse
 import json
 
 from datasets import load_dataset
+from huggingface_hub import HfApi
+from tqdm import tqdm
 
 from config import DATA_DIR, TRAIN_CONFIG, TRAIN_DATASET_ID, TRAIN_SAMPLE_SIZE
 from hf_auth import get_hf_token
 
-TRAIN_PARQUET = f"hf://datasets/{TRAIN_DATASET_ID}/{TRAIN_CONFIG}/train-00000-of-00012.parquet"
+TRAIN_SHARD = "DocVQA/train-00000-of-00012.parquet"
+TRAIN_PARQUET = f"hf://datasets/{TRAIN_DATASET_ID}/{TRAIN_SHARD}"
 
 
 def main():
@@ -28,6 +31,19 @@ def main():
     img_dir = out_dir / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
 
+    try:
+        shard_size = HfApi().dataset_info(TRAIN_DATASET_ID, files_metadata=True)
+        shard_size = next(
+            s.size for s in shard_size.siblings if s.rfilename == TRAIN_SHARD
+        )
+        print(
+            f"source shard: {TRAIN_SHARD} ({shard_size / 1e6:.0f} MB) -- "
+            f"streamed lazily, not fully downloaded upfront"
+        )
+    except (StopIteration, Exception):
+        pass
+    print(f"target: {args.limit} samples -> {out_dir}")
+
     stream = load_dataset(
         "parquet",
         data_files={"train": TRAIN_PARQUET},
@@ -37,7 +53,7 @@ def main():
     )
 
     records = []
-    for i, ex in enumerate(stream):
+    for i, ex in enumerate(tqdm(stream, total=args.limit, unit="sample")):
         if i >= args.limit:
             break
         img_path = img_dir / f"{i:05d}.png"

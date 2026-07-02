@@ -7,6 +7,7 @@ import argparse
 import json
 
 from datasets import load_dataset
+from tqdm import tqdm
 
 from config import (
     DATA_DIR,
@@ -28,6 +29,10 @@ def main():
     out_dir = DATA_DIR / "docvqa_val_monitor"
     img_dir = out_dir / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
+    print(
+        f"target: {args.limit} samples from `{DOCVQA_SPLIT}` split "
+        f"(skipping first {VAL_MONITOR_SKIP}) -> {out_dir}"
+    )
 
     stream = load_dataset(
         DOCVQA_DATASET_ID,
@@ -38,7 +43,7 @@ def main():
     ).skip(VAL_MONITOR_SKIP)
 
     records = []
-    for i, ex in enumerate(stream):
+    for i, ex in enumerate(tqdm(stream, total=args.limit, unit="sample")):
         if i >= args.limit:
             break
         img_path = img_dir / f"{i:04d}.png"

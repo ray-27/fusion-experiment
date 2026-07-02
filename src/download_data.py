@@ -1,6 +1,7 @@
 import json
 
 from datasets import load_dataset
+from tqdm import tqdm
 
 from config import (
     DATA_DIR,
@@ -17,6 +18,7 @@ def main():
     out_dir = DATA_DIR / "docvqa_sample"
     img_dir = out_dir / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
+    print(f"target: {SAMPLE_SIZE} samples from `{DOCVQA_SPLIT}` split -> {out_dir}")
 
     stream = load_dataset(
         DOCVQA_DATASET_ID,
@@ -27,7 +29,7 @@ def main():
     )
 
     records = []
-    for i, ex in enumerate(stream):
+    for i, ex in enumerate(tqdm(stream, total=SAMPLE_SIZE, unit="sample")):
         if i >= SAMPLE_SIZE:
             break
         img_path = img_dir / f"{i:04d}.png"
