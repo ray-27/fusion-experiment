@@ -2,10 +2,16 @@ import argparse
 import csv
 import os
 import random
+import shutil
+from collections import defaultdict
+from datetime import datetime
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader, Subset
 
@@ -29,7 +35,10 @@ VAL_MONITOR_DATA_DIR = DATA_DIR / "docvqa_val_monitor"
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--connector", default=None, help="omit to run all mechanisms")
+    p.add_argument(
+        "--connector", default=None, choices=list(CONNECTORS),
+        help="omit to run all mechanisms",
+    )
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -47,6 +56,15 @@ def parse_args():
         "--test-limit", type=int, default=None,
         help="cap the DocVQA held-out test set size, for fast local smoke tests",
     )
+    p.add_argument(
+        "--debug", action="store_true",
+        help="print the exact tokens fed into the model (padding/image/EOS) "
+        "and the model's predicted tokens for the first --debug-steps steps",
+    )
+    p.add_argument(
+        "--debug-steps", type=int, default=1,
+        help="number of training steps to print --debug output for",
+    )
     return p.parse_args()
 
 
@@ -58,10 +76,63 @@ def set_seed(seed):
 
 
 @torch.no_grad()
-def evaluate(vlm, loader, dataset, max_new_tokens):
+def print_debug_batch(vlm, tokenizer, batch, outputs, name, epoch, step):
+    """Show the exact token sequence the model sees (padding, expanded image
+    tokens, EOS included) alongside the target and predicted tokens."""
+    device = vlm.device
+    pixel_values = batch["pixel_values"]
+    input_ids_list = batch["input_ids_list"]
+    labels_list = batch["labels_list"]
+    pad_id = tokenizer.pad_token_id
+
+    if vlm.fusion_type == "cross_attention":
+        display_ids, _, labels = vlm._pad_text(input_ids_list, labels_list)
+    else:
+        # Text stream keeps a single <image> placeholder; expand it to the
+        # actual number of image tokens the connector emits, so the printed
+        # sequence matches what the LLM really consumes.
+        image_embeds = vlm.connector(vlm._vision_features(pixel_values.to(device)))
+        num_img_tokens = image_embeds.size(1)
+        rows = []
+        for ids in input_ids_list:
+            ids = ids.tolist()
+            pos = ids.index(vlm.image_token_id)
+            rows.append(ids[:pos] + [vlm.image_token_id] * num_img_tokens + ids[pos + 1 :])
+        max_len = max(len(r) for r in rows)
+        display_ids = torch.tensor([r + [pad_id] * (max_len - len(r)) for r in rows])
+        _, _, labels = vlm._merge_prefix(pixel_values, input_ids_list, labels_list)
+
+    logits = outputs.logits
+    print(f"\n{'=' * 22} DEBUG [{name}] epoch {epoch} step {step} {'=' * 22}")
+    for b in range(display_ids.size(0)):
+        ids = display_ids[b]
+        tokens = tokenizer.convert_ids_to_tokens(ids.tolist())
+        print(f"\n[sample {b}] input tokens ({len(tokens)}):")
+        print("  " + " ".join(tokens))
+
+        lab = labels[b]
+        mask = lab != -100
+        target_ids = lab[mask]
+        pred_ids = logits[b].argmax(dim=-1)[mask.to(logits.device)]
+        print(f"[sample {b}] target answer     : {tokenizer.decode(target_ids, skip_special_tokens=False)!r}")
+        print(
+            f"[sample {b}] predicted answer  : "
+            f"{tokenizer.decode(pred_ids, skip_special_tokens=False)!r} "
+            "(teacher-forced, i.e. argmax of logits at answer positions)"
+        )
+    print("=" * 70 + "\n")
+
+
+@torch.no_grad()
+def evaluate(vlm, loader, dataset, max_new_tokens, predictions_path=None):
     """Loss + ANLS over a held-out set. Used both for the training pool's
     internal val split (per-epoch monitoring) and the DocVQA test set
-    (final, never-trained-on evaluation)."""
+    (final, never-trained-on evaluation).
+
+    If `predictions_path` is given, writes one row per sample with the
+    question, the target answer(s), the model's generated prediction, and
+    its ANLS score -- a per-epoch record of what the model actually output
+    vs. what it should have output."""
     vlm.eval()
     total_loss, n_batches = 0.0, 0
     for batch in loader:
@@ -70,14 +141,230 @@ def evaluate(vlm, loader, dataset, max_new_tokens):
     mean_loss = total_loss / max(n_batches, 1)
 
     scores = []
+    rows = []
     for rec in dataset:
         pred = vlm.generate(rec["image"], rec["question"], max_new_tokens=max_new_tokens)
-        scores.append(anls(pred, rec["answers"]))
+        score = anls(pred, rec["answers"])
+        scores.append(score)
+        rows.append(
+            [rec["question"], " | ".join(rec["answers"]), pred, f"{score:.6f}"]
+        )
     vlm.train()
+
+    if predictions_path is not None:
+        predictions_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(predictions_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["question", "target_answers", "predicted_answer", "anls"])
+            writer.writerows(rows)
+
     return mean_loss, sum(scores) / max(len(scores), 1)
 
 
-def train_one(name, args, device, writers):
+def write_run_config(run_dir, name, args, device, n_trainable):
+    """Records every hyperparameter/config value for this run, both as a
+    per-run config.csv (inside its own results/runs/<sweep>/<connector>/
+    folder) and as a row appended to a single results/run_configs.csv
+    registry of all runs ever launched, so runs are easy to compare side by
+    side."""
+    config = {
+        "run_id": f"{run_dir.parent.name}/{run_dir.name}",
+        "connector": name,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "seed": args.seed,
+        "max_new_tokens": args.max_new_tokens,
+        "train_limit": args.train_limit,
+        "test_limit": args.test_limit,
+        "debug": args.debug,
+        "debug_steps": args.debug_steps,
+        "device": str(device),
+        "trainable_params": n_trainable,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    with open(run_dir / "config.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["parameter", "value"])
+        for k, v in config.items():
+            writer.writerow([k, v])
+
+    registry_path = RESULTS_DIR / "run_configs.csv"
+    write_header = not registry_path.exists()
+    with open(registry_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(list(config.keys()))
+        writer.writerow(list(config.values()))
+
+    return config
+
+
+def make_unique_run_dir(base_path):
+    """Guards against silently overwriting a previous sweep's results.
+
+    Sweep folders (results/runs/<timestamp>/, holding every connector run
+    launched together in one invocation) are named by wall-clock timestamp,
+    so re-running later naturally gets a fresh name -- but if two invocations
+    start within the same second (e.g. an automated/scripted loop launching
+    sweeps back to back), the timestamp alone would collide. Append `_v2`,
+    `_v3`, ... until an unused folder name is found, so every sweep always
+    gets its own space."""
+    if not base_path.exists():
+        return base_path
+    i = 2
+    while True:
+        candidate = base_path.with_name(f"{base_path.name}_v{i}")
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
+def write_run_metrics(run_dir, name, train_step_rows, train_epoch_rows, val_loss_rows, val_anls_rows, test_row):
+    """Per-run copies of the same metric CSVs written to the global results/
+    files, scoped to just this run's folder so each run is self-contained."""
+    with open(run_dir / "train_loss.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["connector", "epoch", "step", "loss"])
+        w.writerows([name, e, s, f"{loss:.6f}"] for e, s, loss in train_step_rows)
+
+    with open(run_dir / "train_loss_epoch.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["connector", "epoch", "mean_loss"])
+        w.writerows([name, e, f"{loss:.6f}"] for e, loss in train_epoch_rows)
+
+    with open(run_dir / "val_loss.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["connector", "epoch", "loss"])
+        w.writerows([name, e, f"{loss:.6f}"] for e, loss in val_loss_rows)
+
+    with open(run_dir / "val_anls.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["connector", "epoch", "anls"])
+        w.writerows([name, e, f"{score:.6f}"] for e, score in val_anls_rows)
+
+    test_loss, test_anls_score = test_row
+    with open(run_dir / "test_metrics.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["connector", "test_loss", "test_anls"])
+        w.writerow([name, f"{test_loss:.6f}", f"{test_anls_score:.6f}"])
+
+
+def plot_run_metrics(run_dir, name, train_step_rows, val_loss_rows, val_anls_rows, test_row, n_trainable):
+    """Renders this run's train/val loss + val ANLS curves to metrics.png
+    inside the run's own folder -- no need to run the aggregate
+    results/plot_results.py script just to see how a single run went."""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+
+    steps = [s for _, s, _ in train_step_rows]
+    losses = [loss for _, _, loss in train_step_rows]
+    axes[0].plot(steps, losses, marker=".", alpha=0.8, color="tab:blue")
+    axes[0].set(title="Training loss", xlabel="step", ylabel="loss")
+
+    val_epochs = [e for e, _ in val_loss_rows]
+    val_losses = [loss for _, loss in val_loss_rows]
+    axes[1].plot(val_epochs, val_losses, marker="o", color="tab:orange")
+    axes[1].set(title="Validation loss", xlabel="epoch", ylabel="loss")
+
+    anls_epochs = [e for e, _ in val_anls_rows]
+    anls_scores = [score for _, score in val_anls_rows]
+    axes[2].plot(anls_epochs, anls_scores, marker="o", color="tab:green")
+    axes[2].set(title="Validation ANLS", xlabel="epoch", ylabel="ANLS")
+
+    for ax in axes:
+        ax.grid(True, alpha=0.3)
+
+    test_loss, test_anls_score = test_row
+    fig.suptitle(
+        f"{name}  |  test_loss={test_loss:.4f}  test_anls={test_anls_score:.4f}  "
+        f"trainable_params={n_trainable:,}"
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+
+    out_path = run_dir / "metrics.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def _load_series(path, x_key, y_key):
+    series = defaultdict(lambda: ([], []))  # connector -> (x, y)
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            x, y = series[row["connector"]]
+            x.append(int(row[x_key]))
+            y.append(float(row[y_key]))
+    return series
+
+
+def _load_efficiency(path):
+    names, values = [], []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            names.append(row["connector"])
+            values.append(float(row["anls_per_million_params"]))
+    return names, values
+
+
+def plot_sweep_metrics(sweep_dir):
+    """Combined, multi-connector comparison chart for this whole sweep --
+    same 4-panel layout as results/plot_results.py (train loss, val loss,
+    val ANLS/accuracy, efficiency) -- rendered straight from this sweep
+    folder's own copies of the aggregate CSVs at its root."""
+    train_loss = _load_series(sweep_dir / "train_loss.csv", "step", "loss")
+    val_loss = _load_series(sweep_dir / "val_loss.csv", "epoch", "loss")
+    val_anls = _load_series(sweep_dir / "val_anls.csv", "epoch", "anls")
+    eff_names, eff_values = _load_efficiency(sweep_dir / "efficiency.csv")
+
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4.5))
+
+    for c, (steps, loss) in train_loss.items():
+        axes[0].plot(steps, loss, label=c, alpha=0.8)
+    axes[0].set(title="Training loss", xlabel="step", ylabel="loss")
+
+    for c, (epochs, loss) in val_loss.items():
+        axes[1].plot(epochs, loss, marker="o", label=c)
+    axes[1].set(title="Validation loss", xlabel="epoch", ylabel="loss")
+
+    for c, (epochs, score) in val_anls.items():
+        axes[2].plot(epochs, score, marker="o", label=c)
+    axes[2].set(title="Validation ANLS (accuracy)", xlabel="epoch", ylabel="ANLS")
+
+    axes[3].bar(eff_names, eff_values, color=["tab:blue", "tab:orange", "tab:green"][: len(eff_names)])
+    axes[3].set(
+        title="Efficiency: ANLS per\nmillion trainable params",
+        xlabel="connector",
+        ylabel="ANLS / 1M params",
+    )
+
+    for ax in axes[:3]:
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    axes[3].grid(True, alpha=0.3, axis="y")
+
+    fig.suptitle(f"VLM fusion mechanism ablation -- sweep {sweep_dir.name}")
+    fig.tight_layout()
+
+    out_path = sweep_dir / "metrics.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def write_sweep_summary(sweep_dir, paths, efficiency_path):
+    """Copies the epoch-level loss/accuracy CSVs (and everything else needed
+    to reproduce the plot) into the sweep folder's own root, then renders
+    the combined plot_results.py-style comparison chart there too -- so the
+    whole sweep (all connectors trained together) is fully self-contained
+    in one folder, root-level files included."""
+    for path in list(paths.values()) + [efficiency_path]:
+        shutil.copy2(path, sweep_dir / path.name)
+    return plot_sweep_metrics(sweep_dir)
+
+
+def train_one(name, args, device, writers, run_dir):
     set_seed(args.seed)
     print(f"\n=== connector: {name} ===")
 
@@ -95,6 +382,9 @@ def train_one(name, args, device, writers):
     trainable = [p for p in vlm.connector.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable)
     print(f"trainable connector params: {n_trainable:,}")
+
+    write_run_config(run_dir, name, args, device, n_trainable)
+    print(f"[{name}] run config -> {run_dir / 'config.csv'}")
 
     # Train: DocVQA's own official `train` split.
     train_pool = DocVQADataset(split_dir=TRAIN_DATA_DIR)
@@ -119,31 +409,60 @@ def train_one(name, args, device, writers):
 
     optimizer = torch.optim.AdamW(trainable, lr=args.lr)
 
+    train_step_rows, train_epoch_rows = [], []
+    val_loss_rows, val_anls_rows = [], []
+
     step = 0
     for epoch in range(args.epochs):
         epoch_losses = []
         for batch in train_loader:
             optimizer.zero_grad()
-            loss = vlm(**batch).loss
+            outputs = vlm(**batch)
+            loss = outputs.loss
             loss.backward()
             optimizer.step()
             step += 1
             epoch_losses.append(loss.item())
             writers["train_step"].writerow([name, epoch, step, f"{loss.item():.6f}"])
+            train_step_rows.append((epoch, step, loss.item()))
             print(f"[{name}] epoch {epoch} step {step} train_loss {loss.item():.4f}")
+
+            if args.debug and step <= args.debug_steps:
+                print_debug_batch(vlm, tokenizer, batch, outputs, name, epoch, step)
 
         epoch_mean_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
         writers["train_epoch"].writerow([name, epoch, f"{epoch_mean_loss:.6f}"])
+        train_epoch_rows.append((epoch, epoch_mean_loss))
         print(f"[{name}] epoch {epoch} MEAN train_loss {epoch_mean_loss:.4f}")
 
-        val_loss, val_anls_score = evaluate(vlm, val_loader, val_dataset, args.max_new_tokens)
+        val_predictions_path = run_dir / "val_predictions" / f"epoch_{epoch}.csv"
+        val_loss, val_anls_score = evaluate(
+            vlm, val_loader, val_dataset, args.max_new_tokens,
+            predictions_path=val_predictions_path,
+        )
         writers["val_loss"].writerow([name, epoch, f"{val_loss:.6f}"])
         writers["val_anls"].writerow([name, epoch, f"{val_anls_score:.6f}"])
+        val_loss_rows.append((epoch, val_loss))
+        val_anls_rows.append((epoch, val_anls_score))
         print(f"[{name}] epoch {epoch} val_loss {val_loss:.4f} val_anls {val_anls_score:.4f}")
+        print(f"[{name}] epoch {epoch} val predictions -> {val_predictions_path}")
 
-    test_loss, test_anls_score = evaluate(vlm, test_loader, test_dataset, args.max_new_tokens)
+    test_predictions_path = run_dir / "test_predictions.csv"
+    test_loss, test_anls_score = evaluate(
+        vlm, test_loader, test_dataset, args.max_new_tokens,
+        predictions_path=test_predictions_path,
+    )
     writers["test"].writerow([name, f"{test_loss:.6f}", f"{test_anls_score:.6f}"])
+    print(f"[{name}] test predictions -> {test_predictions_path}")
     print(f"[{name}] FINAL DocVQA test (held out): loss {test_loss:.4f} anls {test_anls_score:.4f}")
+
+    test_row = (test_loss, test_anls_score)
+    write_run_metrics(run_dir, name, train_step_rows, train_epoch_rows, val_loss_rows, val_anls_rows, test_row)
+    metrics_png_path = plot_run_metrics(
+        run_dir, name, train_step_rows, val_loss_rows, val_anls_rows, test_row, n_trainable
+    )
+    print(f"[{name}] run metric CSVs -> {run_dir}/{{train_loss,train_loss_epoch,val_loss,val_anls,test_metrics}}.csv")
+    print(f"[{name}] run metrics plot -> {metrics_png_path}")
 
     CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
     ckpt = CHECKPOINTS_DIR / f"connector_{name}.pt"
@@ -190,11 +509,16 @@ def main():
     for k, w in writers.items():
         w.writerow(headers[k])
 
+    sweep_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    sweep_dir = make_unique_run_dir(RESULTS_DIR / "runs" / sweep_timestamp)
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+
     efficiency_rows = []
     summary_lines = [f"VLM fusion ablation run complete ({device})."]
     try:
         for name in names:
-            n_trainable, final_anls = train_one(name, args, device, writers)
+            run_dir = sweep_dir / name
+            n_trainable, final_anls = train_one(name, args, device, writers, run_dir)
             for f in files.values():
                 f.flush()
             anls_per_million_params = final_anls / (n_trainable / 1e6)
@@ -213,12 +537,19 @@ def main():
         for row in efficiency_rows:
             writer.writerow([row[0], row[1], f"{row[2]:.6f}", f"{row[3]:.6f}"])
 
+    sweep_metrics_png = write_sweep_summary(sweep_dir, paths, efficiency_path)
+
     print(f"\ntrain loss (step)  -> {paths['train_step']}")
     print(f"train loss (epoch) -> {paths['train_epoch']}")
     print(f"val loss           -> {paths['val_loss']}")
     print(f"val anls           -> {paths['val_anls']}")
     print(f"test metrics       -> {paths['test']}")
     print(f"efficiency         -> {efficiency_path}")
+    print(f"run configs        -> {RESULTS_DIR / 'run_configs.csv'}")
+    print(f"\nsweep folder (everything from this run, one place) -> {sweep_dir}/")
+    print(f"  combined comparison plot -> {sweep_metrics_png}")
+    print(f"  combined epoch loss/anls -> {sweep_dir}/{{train_loss_epoch,val_loss,val_anls}}.csv")
+    print(f"  per-connector subfolders -> {sweep_dir}/<connector>/")
 
     if args.notify:
         notify_discord("\n".join(summary_lines))

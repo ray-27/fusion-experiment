@@ -28,6 +28,9 @@ class FusionVLM(nn.Module):
             llm.resize_token_embeddings(len(tokenizer))
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
+        # Silence the repeated "Setting pad_token_id to eos_token_id..." notice
+        # HF's generate() logs whenever generation_config.pad_token_id is unset.
+        llm.generation_config.pad_token_id = tokenizer.pad_token_id
         self.image_token_id = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
 
         for p in self.vision_model.parameters():

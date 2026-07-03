@@ -7,3 +7,7 @@ data/
 models/
 *.log
 .DS_Store
+scripts/
+results/runs
+results/*.png
+results/*.csv
