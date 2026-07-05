@@ -13,6 +13,20 @@ VISION_MODEL_ID = "google/siglip-base-patch16-224"
 # LLM backbone (Phase 1, English).
 LLM_MODEL_ID = "Qwen/Qwen2-0.5B"
 
+# Optional larger ~2B-parameter text-only backbone, selected via `train.py
+# --llm large`. Everything downstream (connector dims, cross-attention layer
+# count, tokenizer/special-token handling) is already read off the loaded
+# model/tokenizer dynamically, so no other code needs to change to swap it in.
+# NOTE: gemma-2-2b is gated on Hugging Face -- you must accept the license at
+# https://huggingface.co/google/gemma-2-2b and set HF_TOKEN in .env before
+# using it (see hf_auth.py).
+LLM_MODEL_ID_LARGE = "google/gemma-2-2b"
+
+LLM_MODEL_CHOICES = {
+    "small": LLM_MODEL_ID,        # Qwen2-0.5B -- default, fast, ungated
+    "large": LLM_MODEL_ID_LARGE,  # gemma-2-2b -- ~2.6B params, gated (needs HF_TOKEN)
+}
+
 # Natively-multimodal reference baseline (NOT part of the controlled fusion
 # ablation -- Qwen2-VL was end-to-end multimodally pretrained on massive data,
 # unlike our from-scratch frozen-backbone connector training). Used only to see

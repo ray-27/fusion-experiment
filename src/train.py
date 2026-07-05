@@ -15,13 +15,14 @@ import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from config import CHECKPOINTS_DIR, DATA_DIR, RESULTS_DIR
+from config import CHECKPOINTS_DIR, DATA_DIR, LLM_MODEL_CHOICES, RESULTS_DIR, VISION_MODEL_ID
 from connectors import CONNECTORS, build_connector
-from data import Collator, DocVQADataset
+from data import Collator, DocVQADataset, WithVisionFeatures
 from device import get_device
 from metrics import anls
 from models import load_llm, load_vision_encoder
 from notify import notify_discord
+from vision_cache import precompute_vision_features
 from vlm import FusionVLM
 
 # Train: DocVQA's own official `train` split (in-domain document reading).
@@ -31,6 +32,7 @@ from vlm import FusionVLM
 # download_val_monitor.py / download_data.py.
 TRAIN_DATA_DIR = DATA_DIR / "train_sample"
 VAL_MONITOR_DATA_DIR = DATA_DIR / "docvqa_val_monitor"
+TEST_DATA_DIR = DATA_DIR / "docvqa_sample"  # DocVQADataset()'s default split dir
 
 
 def parse_args():
@@ -38,6 +40,14 @@ def parse_args():
     p.add_argument(
         "--connector", default=None, choices=list(CONNECTORS),
         help="omit to run all mechanisms",
+    )
+    p.add_argument(
+        "--llm", default="small", choices=list(LLM_MODEL_CHOICES),
+        help=(
+            "LLM backbone: 'small' = Qwen2-0.5B (default, fast, ungated), "
+            "'large' = gemma-2-2b (~2B params, gated -- needs HF_TOKEN + license "
+            "acceptance at huggingface.co/google/gemma-2-2b)"
+        ),
     )
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch-size", type=int, default=2)
@@ -65,6 +75,11 @@ def parse_args():
         "--debug-steps", type=int, default=1,
         help="number of training steps to print --debug output for",
     )
+    p.add_argument(
+        "--no-vision-cache", action="store_true",
+        help="disable precomputing/caching frozen vision-encoder features; "
+        "recomputes them from raw images on every forward pass instead",
+    )
     return p.parse_args()
 
 
@@ -79,11 +94,10 @@ def set_seed(seed):
 def print_debug_batch(vlm, tokenizer, batch, outputs, name, epoch, step):
     """Show the exact token sequence the model sees (padding, expanded image
     tokens, EOS included) alongside the target and predicted tokens."""
-    device = vlm.device
-    pixel_values = batch["pixel_values"]
     input_ids_list = batch["input_ids_list"]
     labels_list = batch["labels_list"]
     pad_id = tokenizer.pad_token_id
+    vision_features = vlm._resolve_vision_features(batch.get("pixel_values"), batch.get("vision_features"))
 
     if vlm.fusion_type == "cross_attention":
         display_ids, _, labels = vlm._pad_text(input_ids_list, labels_list)
@@ -91,7 +105,7 @@ def print_debug_batch(vlm, tokenizer, batch, outputs, name, epoch, step):
         # Text stream keeps a single <image> placeholder; expand it to the
         # actual number of image tokens the connector emits, so the printed
         # sequence matches what the LLM really consumes.
-        image_embeds = vlm.connector(vlm._vision_features(pixel_values.to(device)))
+        image_embeds = vlm.connector(vision_features)
         num_img_tokens = image_embeds.size(1)
         rows = []
         for ids in input_ids_list:
@@ -100,7 +114,7 @@ def print_debug_batch(vlm, tokenizer, batch, outputs, name, epoch, step):
             rows.append(ids[:pos] + [vlm.image_token_id] * num_img_tokens + ids[pos + 1 :])
         max_len = max(len(r) for r in rows)
         display_ids = torch.tensor([r + [pad_id] * (max_len - len(r)) for r in rows])
-        _, _, labels = vlm._merge_prefix(pixel_values, input_ids_list, labels_list)
+        _, _, labels = vlm._merge_prefix(vision_features, input_ids_list, labels_list)
 
     logits = outputs.logits
     print(f"\n{'=' * 22} DEBUG [{name}] epoch {epoch} step {step} {'=' * 22}")
@@ -143,7 +157,10 @@ def evaluate(vlm, loader, dataset, max_new_tokens, predictions_path=None):
     scores = []
     rows = []
     for rec in dataset:
-        pred = vlm.generate(rec["image"], rec["question"], max_new_tokens=max_new_tokens)
+        pred = vlm.generate(
+            rec.get("image"), rec["question"], max_new_tokens=max_new_tokens,
+            vision_features=rec.get("vision_features"),
+        )
         score = anls(pred, rec["answers"])
         scores.append(score)
         rows.append(
@@ -170,6 +187,8 @@ def write_run_config(run_dir, name, args, device, n_trainable):
     config = {
         "run_id": f"{run_dir.parent.name}/{run_dir.name}",
         "connector": name,
+        "llm": args.llm,
+        "llm_model_id": LLM_MODEL_CHOICES[args.llm],
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "lr": args.lr,
@@ -179,6 +198,7 @@ def write_run_config(run_dir, name, args, device, n_trainable):
         "test_limit": args.test_limit,
         "debug": args.debug,
         "debug_steps": args.debug_steps,
+        "vision_cache": not args.no_vision_cache,
         "device": str(device),
         "trainable_params": n_trainable,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -366,10 +386,11 @@ def write_sweep_summary(sweep_dir, paths, efficiency_path):
 
 def train_one(name, args, device, writers, run_dir):
     set_seed(args.seed)
-    print(f"\n=== connector: {name} ===")
+    llm_model_id = LLM_MODEL_CHOICES[args.llm]
+    print(f"\n=== connector: {name}  |  llm: {args.llm} ({llm_model_id}) ===")
 
     image_processor, vision_model = load_vision_encoder()
-    tokenizer, llm = load_llm()
+    tokenizer, llm = load_llm(llm_model_id)
     vision_dim = vision_model.config.vision_config.hidden_size
     llm_dim = llm.config.hidden_size
 
@@ -390,21 +411,40 @@ def train_one(name, args, device, writers, run_dir):
     train_pool = DocVQADataset(split_dir=TRAIN_DATA_DIR)
     if args.train_limit:
         train_pool = Subset(train_pool, list(range(min(args.train_limit, len(train_pool)))))
+
+    # Val (per-epoch monitoring): disjoint slice of the `validation` split.
+    val_dataset = DocVQADataset(split_dir=VAL_MONITOR_DATA_DIR)
+
+    # Test: original held-out slice, touched once at the very end.
+    test_dataset = DocVQADataset(split_dir=TEST_DATA_DIR)
+    if args.test_limit:
+        test_dataset = Subset(test_dataset, list(range(min(args.test_limit, len(test_dataset)))))
+
+    # The vision encoder is frozen and deterministic, so precompute + cache
+    # its output once per split (disk-cached too, so every connector in a
+    # sweep and every future re-run reuses it) instead of re-running the
+    # vision tower on every training step / eval sample.
+    if not args.no_vision_cache:
+        train_pool = WithVisionFeatures(
+            train_pool,
+            precompute_vision_features(train_pool, vision_model, image_processor, device, TRAIN_DATA_DIR, VISION_MODEL_ID),
+        )
+        val_dataset = WithVisionFeatures(
+            val_dataset,
+            precompute_vision_features(val_dataset, vision_model, image_processor, device, VAL_MONITOR_DATA_DIR, VISION_MODEL_ID),
+        )
+        test_dataset = WithVisionFeatures(
+            test_dataset,
+            precompute_vision_features(test_dataset, vision_model, image_processor, device, TEST_DATA_DIR, VISION_MODEL_ID),
+        )
+
     collate = Collator(tokenizer, image_processor)
     train_loader = DataLoader(
         train_pool, batch_size=args.batch_size, shuffle=True, collate_fn=collate
     )
-
-    # Val (per-epoch monitoring): disjoint slice of the `validation` split.
-    val_dataset = DocVQADataset(split_dir=VAL_MONITOR_DATA_DIR)
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate
     )
-
-    # Test: original held-out slice, touched once at the very end.
-    test_dataset = DocVQADataset()
-    if args.test_limit:
-        test_dataset = Subset(test_dataset, list(range(min(args.test_limit, len(test_dataset)))))
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
 
     optimizer = torch.optim.AdamW(trainable, lr=args.lr)
@@ -465,7 +505,7 @@ def train_one(name, args, device, writers, run_dir):
     print(f"[{name}] run metrics plot -> {metrics_png_path}")
 
     CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
-    ckpt = CHECKPOINTS_DIR / f"connector_{name}.pt"
+    ckpt = CHECKPOINTS_DIR / f"connector_{name}_{args.llm}.pt"
     torch.save(vlm.connector.state_dict(), ckpt)
     print(f"[{name}] saved connector -> {ckpt}")
 

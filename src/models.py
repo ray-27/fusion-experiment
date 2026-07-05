@@ -37,13 +37,18 @@ def load_vision_encoder():
     return processor, model
 
 
-def load_llm():
+def load_llm(model_id=None):
+    """`model_id` defaults to the small Qwen2-0.5B backbone (LLM_MODEL_ID);
+    pass e.g. LLM_MODEL_ID_LARGE (see config.py / train.py --llm) to swap in
+    a bigger backbone -- everything else (connectors, tokenizer/special
+    tokens) adapts automatically off this model's own config."""
+    model_id = model_id or LLM_MODEL_ID
     token = get_hf_token()
     tokenizer = AutoTokenizer.from_pretrained(
-        LLM_MODEL_ID, cache_dir=MODELS_DIR, token=token
+        model_id, cache_dir=MODELS_DIR, token=token
     )
     model = AutoModelForCausalLM.from_pretrained(
-        LLM_MODEL_ID, cache_dir=MODELS_DIR, token=token, torch_dtype=torch.float32
+        model_id, cache_dir=MODELS_DIR, token=token, torch_dtype=torch.float32
     )
     model = model.to(get_device()).eval()
     return tokenizer, model

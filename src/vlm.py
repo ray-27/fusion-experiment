@@ -71,10 +71,20 @@ class FusionVLM(nn.Module):
                 pixel_values=pixel_values
             ).last_hidden_state
 
+    def _resolve_vision_features(self, pixel_values, vision_features):
+        """Prefers precomputed vision_features (e.g. loaded from the
+        vision_cache.py disk cache) so the frozen vision tower is skipped
+        entirely; falls back to running it on raw pixel_values otherwise."""
+        if vision_features is not None:
+            return vision_features.to(self.device)
+        if pixel_values is None:
+            raise ValueError("forward()/generate() needs pixel_values or vision_features")
+        return self._vision_features(pixel_values.to(self.device))
+
     # ---- prefix path (mlp_concat, qformer) ----
-    def _merge_prefix(self, pixel_values, input_ids_list, labels_list=None):
+    def _merge_prefix(self, vision_features, input_ids_list, labels_list=None):
         device = self.device
-        image_embeds = self.connector(self._vision_features(pixel_values.to(device)))
+        image_embeds = self.connector(vision_features.to(device))
         embed_layer = self.llm.get_input_embeddings()
 
         merged_embeds, merged_labels = [], []
@@ -122,29 +132,37 @@ class FusionVLM(nn.Module):
         labels = labels.to(device) if labels is not None else None
         return input_ids.to(device), attention_mask.to(device), labels
 
-    def forward(self, pixel_values, input_ids_list, labels_list):
+    def forward(self, input_ids_list, labels_list, pixel_values=None, vision_features=None):
+        vision_features = self._resolve_vision_features(pixel_values, vision_features)
+
         if self.fusion_type == "cross_attention":
-            device = self.device
-            self.connector.set_image(self._vision_features(pixel_values.to(device)))
+            self.connector.set_image(vision_features)
             input_ids, attention_mask, labels = self._pad_text(input_ids_list, labels_list)
             out = self.llm(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             self.connector.clear_image()
             return out
 
         inputs_embeds, attention_mask, labels = self._merge_prefix(
-            pixel_values, input_ids_list, labels_list
+            vision_features, input_ids_list, labels_list
         )
         return self.llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels)
 
     @torch.no_grad()
-    def generate(self, image, prompt: str, max_new_tokens: int = 32):
+    def generate(self, image=None, prompt: str = "", max_new_tokens: int = 32, vision_features=None):
         if IMAGE_TOKEN not in prompt:
             prompt = f"{IMAGE_TOKEN}\n{prompt}"
-        pixel_values = self.image_processor(images=image, return_tensors="pt")["pixel_values"]
         ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
 
+        if vision_features is not None:
+            vision_features = vision_features.to(self.device)
+            if vision_features.dim() == 2:
+                vision_features = vision_features.unsqueeze(0)
+        else:
+            pixel_values = self.image_processor(images=image, return_tensors="pt")["pixel_values"]
+            vision_features = self._vision_features(pixel_values.to(self.device))
+
         if self.fusion_type == "cross_attention":
-            self.connector.set_image(self._vision_features(pixel_values.to(self.device)))
+            self.connector.set_image(vision_features)
             input_ids, attention_mask, _ = self._pad_text([ids])
             out = self.llm.generate(
                 input_ids=input_ids,
@@ -156,7 +174,7 @@ class FusionVLM(nn.Module):
             text = self.tokenizer.decode(out[0, input_ids.size(1):], skip_special_tokens=True)
             return text
 
-        inputs_embeds, attention_mask, _ = self._merge_prefix(pixel_values, [ids])
+        inputs_embeds, attention_mask, _ = self._merge_prefix(vision_features, [ids])
         out = self.llm.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
